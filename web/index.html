@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ontario Transit, Live</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #16181d; --muted: #5d6370; --line: #e3e6eb;
+    --accent: #1d6fd8; --grey: #a9afba;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 20px 24px 8px; }
+  h1 { margin: 0; font-size: 22px; }
+  h2 { margin: 0 0 4px; font-size: 16px; }
+  .sub { color: var(--muted); margin: 2px 0 0; }
+  main { padding: 8px 24px 32px; display: grid; gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+  .stat .v { font-size: 24px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .stat .k { color: var(--muted); font-size: 12px; }
+  .row { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+  #map { height: 520px; border-radius: 8px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; color: var(--muted); font-size: 12px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
+  .feeds { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  .feeds td { padding: 5px 0; border-bottom: 1px solid var(--line); }
+  .feeds td.n { text-align: right; }
+  .bar { height: 6px; background: var(--accent); border-radius: 3px; }
+  .err { color: #c0392b; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 9px 16px; font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { background: var(--grey); cursor: wait; }
+  .race-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+  #race { width: 100%; margin-top: 12px; }
+  .charts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .chart-box { position: relative; height: 260px; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  @media (max-width: 1000px) { .row, .charts { grid-template-columns: 1fr; } .stats { grid-template-columns: repeat(2, 1fr); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Ontario Transit, Live</h1>
+  <p class="sub">Six open GTFS-Realtime feeds, fetched in parallel threads; nearest stop computed in parallel processes.</p>
+</header>
+<main>
+  <section class="card stats">
+    <div class="stat"><div class="v" id="s-vehicles">–</div><div class="k">vehicles on a route</div></div>
+    <div class="stat"><div class="v" id="s-feeds">–</div><div class="k">feeds responding</div></div>
+    <div class="stat"><div class="v" id="s-fetch">–</div><div class="k">fetch, thread pool</div></div>
+    <div class="stat"><div class="v" id="s-analyze">–</div><div class="k" id="s-analyze-k">nearest stop, process pool</div></div>
+    <div class="stat"><div class="v" id="s-next">–</div><div class="k">next poll</div></div>
+  </section>
+
+  <section class="row">
+    <div class="card">
+      <div id="map"></div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="card">
+      <h2>Feed latency, last poll</h2>
+      <table class="feeds" id="feeds"></table>
+      <h2 style="margin-top:18px">Pipeline time per poll</h2>
+      <div class="chart-box" style="height:200px"><canvas id="history"></canvas></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="race-head">
+      <div>
+        <h2>The race: one snapshot, four ways</h2>
+        <p class="sub">Each bar is one real request to one agency, on a shared clock. Sequential waits for each feed in turn; the others overlap the waits.</p>
+      </div>
+      <button id="race-btn">Run the race</button>
+    </div>
+    <svg id="race" viewBox="0 0 1100 220" role="img" aria-label="Fetch strategies race"></svg>
+  </section>
+
+  <section class="charts">
+    <div class="card"><h2>Fetch: median of 10 rounds</h2><div class="chart-box"><canvas id="c-fetch"></canvas></div><p class="note">I/O-bound. Threads and asyncio overlap the network waits.</p></div>
+    <div class="card"><h2>Nearest stop: median of 3 runs</h2><div class="chart-box"><canvas id="c-analyze"></canvas></div><p class="note">CPU-bound. Threads gain nothing under the GIL; how the work is split decides the process speedup.</p></div>
+    <div class="card"><h2>One task per agency: worker time</h2><div class="chart-box"><canvas id="c-agency"></canvas></div><p class="note">Load imbalance: the TTC task alone takes about as long as the whole sequential run.</p></div>
+  </section>
+</main>
+
+<script>
+const COLORS = { TTC: "#d62828", MiWay: "#f77f00", YRT: "#1d70b8", HSR: "#2a9d8f", LTC: "#7b2cbf", DRT: "#4c956c" };
+const fmt = s => s == null ? "–" : `${s.toFixed(2)} s`;
+
+// ---- map -------------------------------------------------------------------
+const map = L.map("map", { preferCanvas: true }).fitBounds([[42.85, -81.4], [44.15, -78.75]]);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 18, attribution: "&copy; OpenStreetMap contributors · transit data: TTC, MiWay, YRT, HSR, LTC, DRT open data"
+}).addTo(map);
+const layer = L.layerGroup().addTo(map);
+document.getElementById("legend").innerHTML = Object.entries(COLORS)
+  .map(([a, c]) => `<span><span class="dot" style="background:${c}"></span>${a}</span>`).join("");
+
+let lastPoll = null, pollSeconds = 30, historyChart;
+
+function drawVehicles(vehicles) {
+  layer.clearLayers();
+  for (const v of vehicles) {
+    L.circleMarker([v.lat, v.lon], { radius: 4, weight: 1, color: "#fff", fillColor: COLORS[v.agency] || "#666", fillOpacity: 0.9 })
+      .bindPopup(`<b>${v.agency} route ${v.route}</b> · vehicle ${v.vehicle_id}<br>Nearest stop: ${v.nearest_stop ?? "–"}` +
+                 (v.stop_distance_m != null ? ` (${Math.round(v.stop_distance_m)} m)` : ""))
+      .addTo(layer);
+  }
+}
+
+function drawFeeds(feeds) {
+  const max = Math.max(...Object.values(feeds).map(f => f.seconds), 0.001);
+  document.getElementById("feeds").innerHTML = Object.entries(feeds)
+    .sort((a, b) => b[1].seconds - a[1].seconds)
+    .map(([a, f]) => `<tr><td><span class="dot" style="background:${COLORS[a]}"></span>${a}</td>
+      <td style="width:45%"><div class="bar" style="width:${(f.seconds / max * 100).toFixed(0)}%;background:${f.error ? "var(--grey)" : COLORS[a]}"></div></td>
+      <td class="n">${f.error ? `<span class="err">${f.error}</span>` : `${f.vehicles}`}</td>
+      <td class="n">${fmt(f.seconds)}</td></tr>`).join("");
+}
+
+function drawHistory(history) {
+  const labels = history.map(h => new Date(h.polled_at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+  const data = [history.map(h => h.fetch_seconds), history.map(h => h.analyze_seconds)];
+  if (!historyChart) {
+    historyChart = new Chart(document.getElementById("history"), {
+      type: "line",
+      data: { labels, datasets: [
+        { label: "fetch (threads)", data: data[0], borderColor: "#1d6fd8", pointRadius: 2, tension: 0.2 },
+        { label: "nearest stop (processes)", data: data[1], borderColor: "#a9afba", pointRadius: 2, tension: 0.2 },
+      ] },
+      options: { maintainAspectRatio: false, animation: false, scales: { y: { beginAtZero: true, title: { display: true, text: "seconds" } } },
+                 plugins: { legend: { labels: { boxWidth: 12 } } } },
+    });
+  } else {
+    historyChart.data.labels = labels;
+    historyChart.data.datasets.forEach((d, i) => d.data = data[i]);
+    historyChart.update();
+  }
+}
+
+async function refresh() {
+  try {
+    const res = await (await fetch("/api/snapshot")).json();
+    pollSeconds = res.poll_seconds;
+    const snap = res.snapshot;
+    if (!snap) { document.getElementById("s-vehicles").textContent = "loading…"; return; }
+    if (snap.polled_at !== lastPoll) {
+      lastPoll = snap.polled_at;
+      drawVehicles(snap.vehicles);
+      drawFeeds(snap.feeds);
+      drawHistory(res.history);
+      const ok = Object.values(snap.feeds).filter(f => !f.error).length;
+      document.getElementById("s-vehicles").textContent = snap.vehicles.length.toLocaleString();
+      document.getElementById("s-feeds").textContent = `${ok} / ${Object.keys(snap.feeds).length}`;
+      document.getElementById("s-fetch").textContent = fmt(snap.fetch_seconds);
+      document.getElementById("s-analyze").textContent = fmt(snap.analyze_seconds);
+      document.getElementById("s-analyze-k").textContent = `nearest stop, ${res.workers} processes`;
+    }
+  } catch (e) { console.error(e); }
+}
+setInterval(() => {
+  if (lastPoll) document.getElementById("s-next").textContent =
+    `${Math.max(0, Math.round(lastPoll + pollSeconds - Date.now() / 1000))} s`;
+}, 500);
+refresh();
+setInterval(refresh, 3000);
+
+// ---- race ------------------------------------------------------------------
+const svg = document.getElementById("race");
+const NS = "http://www.w3.org/2000/svg";
+const el = (tag, attrs, text) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; return e; };
+const X0 = 190, X1 = 1010, ROW = 46, Y0 = 34;
+const STRATEGY_NAMES = ["sequential", "threading", "ThreadPoolExecutor", "asyncio"];
+
+function drawRaceFrame(rows, scale, t) {
+  svg.replaceChildren();
+  const ticks = [];
+  for (let s = 0; s <= scale + 1e-9; s += scale > 4 ? 1 : 0.25) ticks.push(s);
+  for (const s of ticks) {
+    const x = X0 + s / scale * (X1 - X0);
+    svg.append(el("line", { x1: x, x2: x, y1: Y0 - 8, y2: Y0 + rows.length * ROW - 12, stroke: "#e3e6eb" }));
+    svg.append(el("text", { x, y: Y0 - 14, "text-anchor": "middle", "font-size": 11, fill: "#5d6370" }, `${s.toFixed(s % 1 ? 2 : 0)} s`));
+  }
+  rows.forEach((r, i) => {
+    const y = Y0 + i * ROW;
+    svg.append(el("text", { x: 0, y: y + 18, "font-size": 13, "font-weight": 600, fill: "#16181d" }, r.strategy));
+    r.feeds.forEach((f, j) => {
+      const shown = Math.min(Math.max(t, f.start), f.end);
+      if (shown <= f.start) return;
+      const h = 30 / r.feeds.length;
+      svg.append(el("rect", {
+        x: X0 + f.start / scale * (X1 - X0), y: y + j * h, height: Math.max(h - 1, 1),
+        width: Math.max((shown - f.start) / scale * (X1 - X0), 1), rx: 1.5,
+        fill: f.error ? "#a9afba" : COLORS[f.agency],
+      }));
+    });
+    if (t >= r.total) svg.append(el("text", {
+      x: X0 + r.total / scale * (X1 - X0) + 8, y: y + 20, "font-size": 13, "font-weight": 650, fill: "#16181d",
+    }, `${r.total.toFixed(2)} s`));
+  });
+}
+
+document.getElementById("race-btn").addEventListener("click", async (ev) => {
+  const btn = ev.currentTarget;
+  btn.disabled = true; btn.textContent = "Fetching live…";
+  try {
+    const res = await fetch("/api/race", { method: "POST" });
+    const rows = await res.json();
+    if (!res.ok) throw new Error(rows.error);
+    const scale = Math.max(...rows.map(r => r.total)) * 1.08;
+    btn.textContent = "Replaying…";
+    const start = performance.now();
+    await new Promise(done => {
+      const frame = now => {
+        const t = (now - start) / 1000;            // replay in real time
+        drawRaceFrame(rows, scale, t);
+        if (t < scale) requestAnimationFrame(frame); else done();
+      };
+      requestAnimationFrame(frame);
+    });
+  } catch (e) {
+    alert(`Race failed: ${e.message}`);
+  } finally {
+    btn.disabled = false; btn.textContent = "Run the race";
+  }
+});
+drawRaceFrame(STRATEGY_NAMES.map(strategy => ({ strategy, total: Infinity, feeds: [] })), 2, 0);
+svg.append(el("text", { x: (X0 + X1) / 2, y: Y0 + 2 * ROW - 6, "text-anchor": "middle", "font-size": 13, fill: "#5d6370" },
+  "Press “Run the race” to fetch all six feeds live, four ways, and replay them on one clock"));
+// Open /#race to start the race on load (handy when recording the demo).
+if (location.hash === "#race") setTimeout(() => document.getElementById("race-btn").click(), 1500);
+
+// ---- benchmark charts ----------------------------------------------------------
+function barChart(id, rows, highlight) {
+  new Chart(document.getElementById(id), {
+    type: "bar",
+    data: { labels: rows.map(r => r.name), datasets: [{
+      data: rows.map(r => r.seconds),
+      backgroundColor: rows.map(r => highlight(r) ? "#1d6fd8" : "#c3c8d1"), borderRadius: 4,
+    }] },
+    options: {
+      indexAxis: "y", maintainAspectRatio: false, animation: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => fmt(c.parsed.x) } } },
+      scales: { x: { beginAtZero: true, title: { display: true, text: "seconds" } } },
+    },
+  });
+}
+fetch("/api/bench").then(r => r.json()).then(b => {
+  const best = rows => Math.min(...rows.map(r => r.seconds));
+  barChart("c-fetch", b.fetch, r => r.name !== "sequential");
+  barChart("c-analyze", b.analyze, r => r.seconds === best(b.analyze));
+  barChart("c-agency", b.agency_tasks.sort((a, z) => z.seconds - a.seconds), r => r.name === "TTC");
+});
+</script>
+</body>
+</html>

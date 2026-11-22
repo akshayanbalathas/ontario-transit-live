@@ -1,0 +1,5 @@
+__pycache__/
+.venv/
+# Agency data: re-created by stops.py and the benchmarks, not ours to redistribute
+data/
+results/snapshot.json

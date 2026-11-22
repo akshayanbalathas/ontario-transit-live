@@ -1,0 +1,16 @@
+repeat,strategy,seconds,tasks,vehicles
+0,sequential,21.391,1,1424
+0,"threads, dynamic",18.444,57,1424
+0,"processes, by agency",14.057,6,1424
+0,"processes, static chunks",3.195,8,1424
+0,"processes, dynamic",2.626,57,1424
+1,sequential,13.638,1,1424
+1,"threads, dynamic",14.567,57,1424
+1,"processes, by agency",11.89,6,1424
+1,"processes, static chunks",3.181,8,1424
+1,"processes, dynamic",2.681,57,1424
+2,sequential,14.251,1,1424
+2,"threads, dynamic",14.214,57,1424
+2,"processes, by agency",12.823,6,1424
+2,"processes, static chunks",3.809,8,1424
+2,"processes, dynamic",2.924,57,1424
